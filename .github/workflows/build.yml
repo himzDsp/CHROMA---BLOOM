@@ -1,0 +1,107 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dsp-test:
+    name: DSP tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run DSP tests
+        run: |
+          g++ -std=c++17 -O2 -Wall -Wextra -I Source Tests/dsp_test.cpp -o dsp_test
+          ./dsp_test
+
+  build:
+    needs: dsp-test
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+            extra_args: ""
+          - name: macOS
+            os: macos-latest
+            extra_args: -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+          - name: Linux
+            os: ubuntu-latest
+            extra_args: ""
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # JUCE 9 needs libxi-dev (XInput2 multi-touch) and libegl-dev (EGL replaces GLX) on Linux.
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libx11-dev libxinerama-dev \
+            libxext-dev libxrandr-dev libxcursor-dev libxcomposite-dev libxrender-dev \
+            libxi-dev libegl-dev libfreetype-dev libfontconfig1-dev libgl1-mesa-dev
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCHROMA_COPY_AFTER_BUILD=OFF ${{ matrix.extra_args }}
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Upload VST3
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChromaBloom-${{ matrix.name }}-VST3
+          path: build/ChromaBloom_artefacts/Release/VST3
+
+      - name: Upload AU
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChromaBloom-${{ matrix.name }}-AU
+          path: build/ChromaBloom_artefacts/Release/AU
+
+      - name: Upload Standalone
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChromaBloom-${{ matrix.name }}-Standalone
+          path: build/ChromaBloom_artefacts/Release/Standalone
+
+  # Host-compatibility check (parameter automation, state save/load, buffer sizes, sample rates).
+  # Non-blocking until it has been seen passing once on your repository; then remove continue-on-error.
+  pluginval:
+    name: pluginval (Linux VST3)
+    needs: build
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ChromaBloom-Linux-VST3
+          path: vst3
+      - name: Install runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libasound2-dev libx11-dev libxext-dev libxrandr-dev \
+            libxcursor-dev libxinerama-dev libxcomposite-dev libxi-dev libegl-dev \
+            libfreetype-dev libfontconfig1-dev libgl1-mesa-dev
+      - name: Download pluginval
+        run: |
+          curl -fsSL https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_Linux.zip -o pluginval.zip
+          unzip -q pluginval.zip
+          chmod +x pluginval
+      - name: Validate
+        run: xvfb-run -a ./pluginval --strictness-level 5 --validate-in-process "vst3/Chroma Bloom.vst3"
